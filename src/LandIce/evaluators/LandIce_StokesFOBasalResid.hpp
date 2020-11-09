@@ -46,10 +46,10 @@ private:
   ScalarT printedFF;
 
   // Input:
-  PHX::MDField<const BetaScalarT,Cell,Side,QuadPoint>     beta;
-  PHX::MDField<const ScalarT,Cell,Side,QuadPoint,VecDim>  u;
-  PHX::MDField<const RealType,Cell,Side,Node,QuadPoint>   BF;
-  PHX::MDField<const MeshScalarT,Cell,Side,QuadPoint>     w_measure;
+  PHX::MDField<const BetaScalarT>     beta;
+  PHX::MDField<const ScalarT>  u;
+  PHX::MDField<const RealType>   BF;
+  PHX::MDField<const MeshScalarT>     w_measure;
   PHX::MDField<const ScalarT,Dim>                         homotopyParam;
 
   PHX::MDField<const ScalarT,Dim> homotopy;
@@ -57,8 +57,10 @@ private:
   // Output:
   PHX::MDField<ScalarT,Cell,Node,VecDim>            residual;
 
-  std::vector<std::vector<int> >  sideNodes;
+  Kokkos::View<int**, PHX::Device> sideNodes;
   std::string                     basalSideName;
+
+  bool useCollapsedSidesets;
 
   int numSideNodes;
   int numSideQPs;
@@ -67,6 +69,9 @@ private:
   int vecDimFO;
 
   bool regularized;
+
+  Albany::LocalSideSetInfo sideSet;
+
 };
 
 } // Namespace LandIce

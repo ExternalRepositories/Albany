@@ -25,11 +25,13 @@ StokesFOLateralResid (const Teuchos::ParameterList& p,
                               "Error! Lateral side data layout not found.\n");
   Teuchos::RCP<Albany::Layouts> dl_lateral = dl->side_layouts.at(lateralSideName);
 
+  useCollapsedSidesets = dl_lateral->useCollapsedSidesets;
+
   // Create dependent fields
-  thickness  = decltype(thickness)(p.get<std::string> ("Ice Thickness Variable Name"), dl_lateral->qp_scalar);
-  BF         = decltype(BF)(p.get<std::string> ("BF Side Name"), dl_lateral->node_qp_scalar);
-  normals    = decltype(normals)(p.get<std::string> ("Side Normal Name"), dl_lateral->qp_vector_spacedim);
-  w_measure  = decltype(w_measure)(p.get<std::string> ("Weighted Measure Name"), dl_lateral->qp_scalar);
+  thickness  = decltype(thickness)(p.get<std::string> ("Ice Thickness Variable Name"), useCollapsedSidesets ? dl_lateral->qp_scalar_sideset : dl_lateral->qp_scalar);
+  BF         = decltype(BF)(p.get<std::string> ("BF Side Name"), useCollapsedSidesets ? dl_lateral->node_qp_scalar_sideset : dl_lateral->node_qp_scalar);
+  normals    = decltype(normals)(p.get<std::string> ("Side Normal Name"), useCollapsedSidesets ? dl_lateral->qp_vector_spacedim_sideset : dl_lateral->qp_vector_spacedim);
+  w_measure  = decltype(w_measure)(p.get<std::string> ("Weighted Measure Name"), useCollapsedSidesets ? dl_lateral->qp_scalar_sideset : dl_lateral->qp_scalar);
 
   this->addDependentField(thickness);
   this->addDependentField(BF);
@@ -41,12 +43,12 @@ StokesFOLateralResid (const Teuchos::ParameterList& p,
   if (immerse_ratio_provided) {
     given_immersed_ratio = bc_pl.get<double>("Immersed Ratio");
   } else {
-    elevation = decltype(elevation)(p.get<std::string> ("Ice Surface Elevation Variable Name"), dl_lateral->qp_scalar);
+    elevation = decltype(elevation)(p.get<std::string> ("Ice Surface Elevation Variable Name"), useCollapsedSidesets ? dl_lateral->qp_scalar_sideset : dl_lateral->qp_scalar);
     this->addDependentField(elevation);
   }
 
   // Create evaluated field
-  residual = decltype(residual)(p.get<std::string> ("Residual Variable Name"),dl->node_vector);
+  residual = decltype(residual)(p.get<std::string> ("Residual Variable Name"), dl->node_vector);
   this->addContributedField(residual);
 
   // Get stereographic map info
@@ -71,7 +73,6 @@ StokesFOLateralResid (const Teuchos::ParameterList& p,
   // Get dimensions
   std::vector<PHX::DataLayout::size_type> dims;
   dl_lateral->node_qp_gradient->dimensions(dims);
-  int numSides = dims[1];
   numSideNodes = dims[2];
   numSideQPs   = dims[3];
   dl->node_vector->dimensions(dims);
@@ -80,14 +81,19 @@ StokesFOLateralResid (const Teuchos::ParameterList& p,
   // Index of the nodes on the sides in the numeration of the cell
   Teuchos::RCP<shards::CellTopology> cellType;
   cellType = p.get<Teuchos::RCP <shards::CellTopology> > ("Cell Type");
-  sideNodes.resize(numSides);
   int sideDim = cellType->getDimension()-1;
+  int numSides = cellType->getSideCount();
+  int nodeMax = 0;
+  for (int side=0; side<numSides; ++side) {
+    int thisSideNodes = cellType->getNodeCount(sideDim,side);
+    nodeMax = std::max(nodeMax, thisSideNodes);
+  }
+  sideNodes = Kokkos::View<int**, PHX::Device>("sideNodes", numSides, nodeMax);
   for (int side=0; side<numSides; ++side) {
     // Need to get the subcell exact count, since different sides may have different number of nodes (e.g., Wedge)
     int thisSideNodes = cellType->getNodeCount(sideDim,side);
-    sideNodes[side].resize(thisSideNodes);
     for (int node=0; node<thisSideNodes; ++node) {
-      sideNodes[side][node] = cellType->getNodeMap(sideDim,side,node);
+      sideNodes(side,node) = cellType->getNodeMap(sideDim,side,node);
     }
   }
 
@@ -118,9 +124,9 @@ postRegistrationSetup(typename Traits::SetupData d,
 template<typename EvalT, typename Traits, typename ThicknessScalarT>
 void StokesFOLateralResid<EvalT, Traits, ThicknessScalarT>::evaluateFields (typename Traits::EvalData workset)
 {
-  if (workset.sideSets->find(lateralSideName)==workset.sideSets->end()) {
-    return;
-  }
+  if (workset.sideSetViews->find(lateralSideName)==workset.sideSetViews->end()) return;
+
+  sideSet = workset.sideSetViews->at(lateralSideName);
 
   if (immerse_ratio_provided) {
     evaluate_with_given_immersed_ratio(workset);
@@ -132,37 +138,69 @@ void StokesFOLateralResid<EvalT, Traits, ThicknessScalarT>::evaluateFields (type
 template<typename EvalT, typename Traits, typename ThicknessScalarT>
 void StokesFOLateralResid<EvalT, Traits, ThicknessScalarT>::evaluate_with_computed_immersed_ratio (typename Traits::EvalData workset)
 {
-  const std::vector<Albany::SideStruct>& sideSet = workset.sideSets->at(lateralSideName);
-
   const OutputScalarT zero (0.0);
   const ThicknessScalarT threshold (1e-8);
   const OutputScalarT one (1.0);
 
-  for (auto const& it_side : sideSet) {
-    // Get the local data of side and cell
-    const int cell = it_side.elem_LID;
-    const int side = it_side.side_local_id;
+  if (useCollapsedSidesets) {
+    for (int sideSet_idx = 0; sideSet_idx < sideSet.size; ++sideSet_idx)
+    {
+      // Get the local data of side and cell
+      const int cell = sideSet.elem_LID(sideSet_idx);
+      const int side = sideSet.side_local_id(sideSet_idx);
 
-    for (int qp=0; qp<numSideQPs; ++qp) {
-      const ThicknessScalarT H = thickness(cell,side,qp);
-      const MeshScalarT      s = elevation(cell,side,qp);
-      const OutputScalarT immersed_ratio = H>threshold ? std::max(zero,std::min(one,1-s/H)) : zero;
-      OutputScalarT w_normal_stress = -0.5 * g * H * (rho_i - rho_w*immersed_ratio*immersed_ratio) * w_measure(cell,side,qp);
-      if (use_stereographic_map) {
-        const MeshScalarT x = coords_qp(cell,side,qp,0) - X_0;
-        const MeshScalarT y = coords_qp(cell,side,qp,1) - Y_0;
-        const MeshScalarT h = 4.0*R2/(4.0*R2 + x*x + y*y);
-        w_normal_stress *= h;
+      for (int qp=0; qp<numSideQPs; ++qp) {
+        const ThicknessScalarT H = thickness(sideSet_idx,qp);
+        const MeshScalarT      s = elevation(sideSet_idx,qp);
+        const OutputScalarT immersed_ratio = H>threshold ? std::max(zero,std::min(one,1-s/H)) : zero;
+        OutputScalarT w_normal_stress = -0.5 * g * H * (rho_i - rho_w*immersed_ratio*immersed_ratio) * w_measure(sideSet_idx,qp);
+        if (use_stereographic_map) {
+          const MeshScalarT x = coords_qp(sideSet_idx,qp,0) - X_0;
+          const MeshScalarT y = coords_qp(sideSet_idx,qp,1) - Y_0;
+          const MeshScalarT h = 4.0*R2/(4.0*R2 + x*x + y*y);
+          w_normal_stress *= h;
+        }
+        for (int node=0; node<numSideNodes; ++node) {
+          int sideNode = sideNodes(side,node);
+          // The immersed ratio should be between 0 and 1. If s>=H, it is 0, since the ice bottom is at s-H, which is >=0.
+          // If s<=0, it is 1, since the top is already under water. If 0<s<H it is somewhere in (0,1), since the top is above the sea level,
+          // but the bottom is s-H<0, which is below the sea level.
+          // NOTE: we are RELYING on the fact that the lateral side is vertical, so that u*n = ux*nx+uy*ny.
+          const OutputScalarT w_normal_stress_bf = w_normal_stress * BF(sideSet_idx,node,qp);
+          for (int dim=0; dim<vecDimFO; ++dim) {
+            residual(cell,sideNode,dim) += w_normal_stress_bf * normals(sideSet_idx,qp,dim);
+          }
+        }
       }
-      for (int node=0; node<numSideNodes; ++node) {
-        int sideNode = sideNodes[side][node];
-        // The immersed ratio should be between 0 and 1. If s>=H, it is 0, since the ice bottom is at s-H, which is >=0.
-        // If s<=0, it is 1, since the top is already under water. If 0<s<H it is somewhere in (0,1), since the top is above the sea level,
-        // but the bottom is s-H<0, which is below the sea level.
-        // NOTE: we are RELYING on the fact that the lateral side is vertical, so that u*n = ux*nx+uy*ny.
-        const OutputScalarT w_normal_stress_bf = w_normal_stress * BF(cell,side,node,qp);
-        for (int dim=0; dim<vecDimFO; ++dim) {
-          residual(cell,sideNode,dim) += w_normal_stress_bf * normals(cell,side,qp,dim);
+    }
+  } else {
+    for (int sideSet_idx = 0; sideSet_idx < sideSet.size; ++sideSet_idx)
+    {
+      // Get the local data of side and cell
+      const int cell = sideSet.elem_LID(sideSet_idx);
+      const int side = sideSet.side_local_id(sideSet_idx);
+
+      for (int qp=0; qp<numSideQPs; ++qp) {
+        const ThicknessScalarT H = thickness(cell,side,qp);
+        const MeshScalarT      s = elevation(cell,side,qp);
+        const OutputScalarT immersed_ratio = H>threshold ? std::max(zero,std::min(one,1-s/H)) : zero;
+        OutputScalarT w_normal_stress = -0.5 * g * H * (rho_i - rho_w*immersed_ratio*immersed_ratio) * w_measure(cell,side,qp);
+        if (use_stereographic_map) {
+          const MeshScalarT x = coords_qp(cell,side,qp,0) - X_0;
+          const MeshScalarT y = coords_qp(cell,side,qp,1) - Y_0;
+          const MeshScalarT h = 4.0*R2/(4.0*R2 + x*x + y*y);
+          w_normal_stress *= h;
+        }
+        for (int node=0; node<numSideNodes; ++node) {
+          int sideNode = sideNodes(side,node);
+          // The immersed ratio should be between 0 and 1. If s>=H, it is 0, since the ice bottom is at s-H, which is >=0.
+          // If s<=0, it is 1, since the top is already under water. If 0<s<H it is somewhere in (0,1), since the top is above the sea level,
+          // but the bottom is s-H<0, which is below the sea level.
+          // NOTE: we are RELYING on the fact that the lateral side is vertical, so that u*n = ux*nx+uy*ny.
+          const OutputScalarT w_normal_stress_bf = w_normal_stress * BF(cell,side,node,qp);
+          for (int dim=0; dim<vecDimFO; ++dim) {
+            residual(cell,sideNode,dim) += w_normal_stress_bf * normals(cell,side,qp,dim);
+          }
         }
       }
     }
@@ -172,32 +210,60 @@ void StokesFOLateralResid<EvalT, Traits, ThicknessScalarT>::evaluate_with_comput
 template<typename EvalT, typename Traits, typename ThicknessScalarT>
 void StokesFOLateralResid<EvalT, Traits, ThicknessScalarT>::evaluate_with_given_immersed_ratio (typename Traits::EvalData workset)
 {
-  const std::vector<Albany::SideStruct>& sideSet = workset.sideSets->at(lateralSideName);
+  if (useCollapsedSidesets) {
+    for (int sideSet_idx = 0; sideSet_idx < sideSet.size; ++sideSet_idx)
+    {
+      // Get the local data of side and cell
+      const int cell = sideSet.elem_LID(sideSet_idx);
+      const int side = sideSet.side_local_id(sideSet_idx);
 
-  for (auto const& it_side : sideSet) {
-    // Get the local data of side and cell
-    const int cell = it_side.elem_LID;
-    const int side = it_side.side_local_id;
-
-    for (int qp=0; qp<numSideQPs; ++qp) {
-      const ThicknessScalarT H = thickness(cell,side,qp);
-      OutputScalarT w_normal_stress = -0.5 * g * H * (rho_i - rho_w*given_immersed_ratio*given_immersed_ratio) * w_measure(cell,side,qp);
-      if (use_stereographic_map) {
-        const MeshScalarT x = coords_qp(cell,side,qp,0) - X_0;
-        const MeshScalarT y = coords_qp(cell,side,qp,1) - Y_0;
-        const MeshScalarT h = 4.0*R2/(4.0*R2 + x*x + y*y);
-        w_normal_stress *= h;
+      for (int qp=0; qp<numSideQPs; ++qp) {
+        const ThicknessScalarT H = thickness(sideSet_idx,qp);
+        OutputScalarT w_normal_stress = -0.5 * g * H * (rho_i - rho_w*given_immersed_ratio*given_immersed_ratio) * w_measure(sideSet_idx,qp);
+        if (use_stereographic_map) {
+          const MeshScalarT x = coords_qp(sideSet_idx,qp,0) - X_0;
+          const MeshScalarT y = coords_qp(sideSet_idx,qp,1) - Y_0;
+          const MeshScalarT h = 4.0*R2/(4.0*R2 + x*x + y*y);
+          w_normal_stress *= h;
+        }
+        for (int node=0; node<numSideNodes; ++node) {
+          int sideNode = sideNodes(side,node);
+          // NOTE: we are RELYING on the fact that the lateral side is vertical, so that u*n = ux*nx+uy*ny.
+          const OutputScalarT w_normal_stress_bf = w_normal_stress * BF(sideSet_idx,node,qp);
+          for (int dim=0; dim<vecDimFO; ++dim) {
+            residual(cell,sideNode,dim) += w_normal_stress_bf * normals(sideSet_idx,qp,dim);
+          }
+        }
       }
-      for (int node=0; node<numSideNodes; ++node) {
-        int sideNode = sideNodes[side][node];
-        // NOTE: we are RELYING on the fact that the lateral side is vertical, so that u*n = ux*nx+uy*ny.
-        const OutputScalarT w_normal_stress_bf = w_normal_stress * BF(cell,side,node,qp);
-        for (int dim=0; dim<vecDimFO; ++dim) {
-          residual(cell,sideNode,dim) += w_normal_stress_bf * normals(cell,side,qp,dim);
+    }
+  } else {
+    for (int sideSet_idx = 0; sideSet_idx < sideSet.size; ++sideSet_idx)
+    {
+      // Get the local data of side and cell
+      const int cell = sideSet.elem_LID(sideSet_idx);
+      const int side = sideSet.side_local_id(sideSet_idx);
+
+      for (int qp=0; qp<numSideQPs; ++qp) {
+        const ThicknessScalarT H = thickness(cell,side,qp);
+        OutputScalarT w_normal_stress = -0.5 * g * H * (rho_i - rho_w*given_immersed_ratio*given_immersed_ratio) * w_measure(cell,side,qp);
+        if (use_stereographic_map) {
+          const MeshScalarT x = coords_qp(cell,side,qp,0) - X_0;
+          const MeshScalarT y = coords_qp(cell,side,qp,1) - Y_0;
+          const MeshScalarT h = 4.0*R2/(4.0*R2 + x*x + y*y);
+          w_normal_stress *= h;
+        }
+        for (int node=0; node<numSideNodes; ++node) {
+          int sideNode = sideNodes(side,node);
+          // NOTE: we are RELYING on the fact that the lateral side is vertical, so that u*n = ux*nx+uy*ny.
+          const OutputScalarT w_normal_stress_bf = w_normal_stress * BF(cell,side,node,qp);
+          for (int dim=0; dim<vecDimFO; ++dim) {
+            residual(cell,sideNode,dim) += w_normal_stress_bf * normals(cell,side,qp,dim);
+          }
         }
       }
     }
   }
+  
 }
 
 } // Namespace LandIce

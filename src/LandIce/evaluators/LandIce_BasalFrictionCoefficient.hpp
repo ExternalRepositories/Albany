@@ -91,6 +91,8 @@ private:
 
   double rho_i, rho_w;    // [kg m^{-3}]
 
+  bool useCollapsedSidesets;
+
   int numNodes;
   int numQPs;
 
@@ -106,6 +108,8 @@ private:
   BETA_TYPE beta_type;
 
   PHAL::MDFieldMemoizer<Traits> memoizer;
+
+  Albany::LocalSideSetInfo sideSet;
 };
 
 } // Namespace LandIce
